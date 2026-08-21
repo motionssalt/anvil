@@ -56,15 +56,33 @@ def load_model() -> Dict[str, Any]:
     _log("first-time download is ~5–8 GB of weights, please be patient …")
     bnb_cfg = None
     if LOAD_IN_4BIT:
-        bnb_cfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                                     bnb_4bit_use_double_quant=True,
-                                     bnb_4bit_compute_dtype=torch.float16)
+        bnb_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            # Required when Accelerate places any non-quantized modules on CPU.
+            llm_int8_enable_fp32_cpu_offload=True,
+        )
     started = time.time()
     processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+    offload_dir = "/content/anvil_offload"
+    # A Colab T4 reports about 14.6 GB usable VRAM. Leave headroom for
+    # CUDA/vision buffers and let Accelerate keep overflow on CPU instead of
+    # failing validation when the model cannot fit entirely on the card.
+    gpu_budget_gb = max(8, int(vram_gb) - 1)
+    max_memory = {0: f"{gpu_budget_gb}GiB", "cpu": "32GiB"}
+    _log(f"loading with up to {gpu_budget_gb} GiB GPU memory and CPU offload …")
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        MODEL_ID, quantization_config=bnb_cfg,
+        MODEL_ID,
+        quantization_config=bnb_cfg,
         torch_dtype=torch.float16 if not LOAD_IN_4BIT else None,
-        device_map="auto", trust_remote_code=True)
+        device_map="auto",
+        max_memory=max_memory,
+        offload_folder=offload_dir,
+        offload_state_dict=True,
+        trust_remote_code=True,
+    )
     model.eval()
     _log(f"model loaded in {time.time() - started:.1f}s")
     return {"model": model, "processor": processor, "model_id": MODEL_ID,
