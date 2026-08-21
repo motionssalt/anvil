@@ -36,9 +36,9 @@ pip install -e .
 python scripts/run_anvil.py
 ```
 
-The default model is `Qwen/Qwen2.5-VL-7B-Instruct` loaded in 4-bit mode for a free-tier T4. The agent provides Python and shell execution, file I/O, image viewing, web search/fetch, and dual-mode file delivery through the Gradio UI.
+The default model is `Qwen/Qwen3-VL-8B-Instruct` (native structured tool calling), loaded in 4-bit NF4 on a free-tier T4/L4 and in full precision on larger GPUs (A100). The agent provides Python and shell execution, self-directed package installs, file I/O, image viewing, web search/fetch, and dual-mode file delivery — direct download plus a tempfile.org link — both surfaced inline in the chat.
 
-The chat launcher detects the installed Gradio `Chatbot` API at runtime. It uses message history when `type="messages"` is supported and automatically falls back to the legacy tuple history format when it is not, preventing the `Chatbot.__init__() got an unexpected keyword argument 'type'` and initial-history format errors seen in some Colab runtimes.
+The UI is a single chat stream: tool calls stream inline as collapsed, expandable entries; the model's reasoning appears inline where it happens; delivered files attach directly to the chat message where they are produced. The temp-link expiry setting lives in a collapsed Settings accordion (default 6 hours). The agent loop uses the model's native tool calling — tool results return as real `role="tool"` messages, so the agent cannot fabricate observations.
 
 The model loader is tuned for a Colab T4: it reserves VRAM headroom, enables the BitsAndBytes CPU-offload option required for non-quantized modules, and supplies an offload directory plus explicit CPU memory to Accelerate. This avoids the quantized-model dispatch failure that occurs when a 14.6 GB T4 cannot hold every module on the GPU.
 
