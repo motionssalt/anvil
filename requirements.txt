@@ -1,0 +1,16 @@
+torch
+transformers>=4.45.0
+accelerate>=0.34.0
+bitsandbytes>=0.43.0
+sentencepiece
+safetensors
+pillow
+qwen-vl-utils
+gradio>=4.44.0
+duckduckgo-search>=6.2.0
+beautifulsoup4
+lxml
+readability-lxml
+requests
+httpx
+markdownify
