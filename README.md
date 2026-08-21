@@ -2,6 +2,8 @@
 
 **A two-cell autonomous agent notebook for Google Colab.**
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/motionssalt/anvil/blob/main/anvil.ipynb)
+
 Anvil turns a free (or paid) Colab GPU runtime into a persistent,
 tool-using AI agent with a real chat + file-upload interface, running
 entirely inside the notebook. Open it, run two cells, and you have a
@@ -80,9 +82,8 @@ reply — the log is process, the message is the answer.
 
 ## How to run
 
-1. Open `anvil.ipynb` in Google Colab
-   (`File → Upload notebook`, or push this repo to GitHub and open it
-   via `Open notebook → GitHub`).
+1. Click **Open in Colab** above (or open directly:
+   https://colab.research.google.com/github/motionssalt/anvil/blob/main/anvil.ipynb).
 2. `Runtime → Change runtime type → GPU` (T4 is fine).
 3. Run **Cell 1**. Wait for the "✅ Anvil is ready" line — first run
    takes a few minutes to download the model weights.
