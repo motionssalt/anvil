@@ -38,6 +38,8 @@ python scripts/run_anvil.py
 
 The default model is `Qwen/Qwen2.5-VL-7B-Instruct` loaded in 4-bit mode for a free-tier T4. The agent provides Python and shell execution, file I/O, image viewing, web search/fetch, and dual-mode file delivery through the Gradio UI.
 
+The chat launcher detects the installed Gradio `Chatbot` API at runtime. It uses message history when `type="messages"` is supported and automatically falls back to the legacy tuple history format when it is not, preventing the `Chatbot.__init__() got an unexpected keyword argument 'type'` and initial-history format errors seen in some Colab runtimes.
+
 ## Notes
 
 The first notebook cell clones the repository into `/content/anvil` when the source files are not already present, so the notebook works when opened directly from GitHub in Colab. The implementation is kept outside the notebook so it can be imported, tested, and run from the command line without turning the notebook into a wall of raw source code.
