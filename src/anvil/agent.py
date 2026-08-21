@@ -45,7 +45,7 @@ MAX_NEW    = ANVIL["max_new_tokens"]
 # ---------------------------------------------------------------------
 # Workspace inside the Colab VM
 # ---------------------------------------------------------------------
-WORKDIR = Path("/content/anvil_workspace")
+WORKDIR = Path(os.environ.get("ANVIL_WORKDIR", "/content/anvil_workspace"))
 WORKDIR.mkdir(parents=True, exist_ok=True)
 os.chdir(WORKDIR)
 
