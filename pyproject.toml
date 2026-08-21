@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anvil-agent"
+version = "0.1.0"
+description = "A Colab-friendly autonomous, tool-using AI agent"
+requires-python = ">=3.10"
+dependencies = [
+  "torch",
+  "transformers>=4.45.0",
+  "accelerate>=0.34.0",
+  "bitsandbytes>=0.43.0",
+  "sentencepiece",
+  "safetensors",
+  "pillow",
+  "qwen-vl-utils",
+  "gradio>=4.44.0",
+  "duckduckgo-search>=6.2.0",
+  "beautifulsoup4",
+  "lxml",
+  "readability-lxml",
+  "requests",
+  "httpx",
+  "markdownify",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
