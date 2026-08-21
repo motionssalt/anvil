@@ -66,21 +66,17 @@ def load_model() -> Dict[str, Any]:
         )
     started = time.time()
     processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
-    offload_dir = "/content/anvil_offload"
-    # A Colab T4 reports about 14.6 GB usable VRAM. Leave headroom for
-    # CUDA/vision buffers and let Accelerate keep overflow on CPU instead of
-    # failing validation when the model cannot fit entirely on the card.
-    gpu_budget_gb = max(8, int(vram_gb) - 1)
-    max_memory = {0: f"{gpu_budget_gb}GiB", "cpu": "32GiB"}
-    _log(f"loading with up to {gpu_budget_gb} GiB GPU memory and CPU offload …")
+    # Do not use automatic device placement here. On a T4, Accelerate may place one
+    # small module on CPU or disk, and BitsAndBytes then rejects the whole
+    # quantized load before the model is constructed. The 4-bit 7B model fits
+    # on a 14.6 GB T4, so keep the complete quantized model on CUDA instead.
+    device_map = {"": 0}
+    _log("loading the complete 4-bit model on CUDA device 0 …")
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         MODEL_ID,
         quantization_config=bnb_cfg,
-        torch_dtype=torch.float16 if not LOAD_IN_4BIT else None,
-        device_map="auto",
-        max_memory=max_memory,
-        offload_folder=offload_dir,
-        offload_state_dict=True,
+        torch_dtype=torch.float16,
+        device_map=device_map,
         trust_remote_code=True,
     )
     model.eval()
