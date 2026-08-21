@@ -5,17 +5,24 @@
 # here on. Do NOT run any more cells after this one — everything
 # happens inside the Gradio UI. When you're done, interrupt this cell.
 #
-# The Gradio UI has:
-#   • A chat pane (with file-upload paperclip)
-#   • A "🧠 Thought process" pane that updates live as the agent works
-#   • A file-output area for anything the agent produces
-#   • A "TempFile.org expiry" dropdown so you can override per-run
+# The UI is a single chat stream, in the style of a standard AI agent
+# interface:
+#   • Tool calls stream INLINE in the chat as collapsed, expandable
+#     entries (arguments + truncated result inside; click to expand).
+#   • The model's reasoning appears inline, right where it happens.
+#   • Delivered files appear as attachments in the chat message where
+#     they are produced — each with BOTH a direct download (rendered
+#     file attachment) and a tempfile.org temporary link.
+#   • The download-link expiry lives in a collapsed Settings accordion,
+#     not on the main screen.
 #
-# Under the hood: a hand-rolled ReAct loop feeding a vision-capable
-# tool-calling LLM. Tools include python/shell exec, self-directed
-# `pip`/`apt` install, file I/O, image viewing, web search + fetch,
-# and a `deliver_file` tool that hands files back through BOTH the
-# Gradio download AND a tempfile.org temporary link.
+# Under the hood: the model's NATIVE structured tool calling
+# (Qwen3-VL emits <tool_call>{...}</tool_call> blocks), not a parsed
+# free-text Thought/Action/Observation format. Tool results go back to
+# the model as real role="tool" messages, so the agent can never
+# fabricate an Observation — it only ever sees genuine tool output.
+# Tools: python/shell exec, self-directed pip/apt install, file I/O,
+# image viewing, web search + fetch, dual-path file delivery.
 # =====================================================================
 
 import os, sys, io, re, json, time, base64, uuid, shutil, tempfile
@@ -52,9 +59,9 @@ os.chdir(WORKDIR)
 # ---------------------------------------------------------------------
 # Gradio compatibility
 # ---------------------------------------------------------------------
-# Gradio 4/5 commonly supports Chatbot(type="messages"), while some
-# Colab runtimes ship a newer or older Chatbot API. Keep the UI and
-# callback history format aligned with the installed constructor.
+# The inline tool-call UI needs the messages-format Chatbot (metadata
+# titles render as collapsible entries). gradio>=4.44 supports it; if a
+# runtime ships something older we degrade to plain text in tuples.
 import inspect
 
 _CHATBOT_PARAMETERS = inspect.signature(gr.Chatbot.__init__).parameters
@@ -63,30 +70,14 @@ try:
     _GRADIO_MAJOR = int(str(getattr(gr, "__version__", "0")).split(".")[0])
 except (TypeError, ValueError):
     _GRADIO_MAJOR = 0
-# Gradio 5/6 removed or changed the constructor keyword but require
-# messages dictionaries. Older Gradio 3/4 runtimes use tuple history.
 _CHATBOT_USES_MESSAGES = _CHATBOT_SUPPORTS_TYPE or _GRADIO_MAJOR >= 5
+_HAS_MULTIMODAL_TEXTBOX = hasattr(gr, "MultimodalTextbox")
 
 
 def _chatbot_history_initial():
     if _CHATBOT_USES_MESSAGES:
-        return [{"role": "assistant", "content": "Anvil is ready."}]
-    return [[None, "Anvil is ready."]]
-
-def _chatbot_history_add_turn(history, user_text):
-    if _CHATBOT_USES_MESSAGES:
-        return history + [
-            {"role": "user", "content": user_text},
-            {"role": "assistant", "content": "*thinking…*"},
-        ]
-    return history + [[user_text, "*thinking…*"]]
-
-def _chatbot_history_set_assistant(history, text):
-    if _CHATBOT_USES_MESSAGES:
-        history[-1] = {"role": "assistant", "content": text}
-    else:
-        history[-1][1] = text
-    return history
+        return []
+    return []
 
 # ---------------------------------------------------------------------
 # TempFile.org uploader — verified against https://tempfile.org/api
@@ -94,8 +85,9 @@ def _chatbot_history_set_assistant(history, text):
 TEMPFILE_API   = "https://tempfile.org/api/upload/local"
 TEMPFILE_LIMIT = 100 * 1024 * 1024   # 100 MB per file, per the docs
 VALID_EXPIRY   = (1, 6, 24, 48)
+DEFAULT_EXPIRY = 6
 
-def tempfile_upload(path: str, expiry_hours: int = 1) -> Dict[str, Any]:
+def tempfile_upload(path: str, expiry_hours: int = DEFAULT_EXPIRY) -> Dict[str, Any]:
     """
     Upload a single file to tempfile.org and return
         {"ok": True, "url": "...", "expiry_hours": N}
@@ -110,7 +102,7 @@ def tempfile_upload(path: str, expiry_hours: int = 1) -> Dict[str, Any]:
         return {"ok": False,
                 "error": f"file is {size/1e6:.1f} MB, exceeds tempfile.org's 100 MB limit"}
     if expiry_hours not in VALID_EXPIRY:
-        expiry_hours = 1
+        expiry_hours = DEFAULT_EXPIRY
     try:
         with open(p, "rb") as fh:
             r = requests.post(
@@ -140,7 +132,6 @@ def tool_run_python(code: str) -> str:
     err = None
     last_val = None
     try:
-        # Try to split trailing expression for repr
         tree_src = code
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
             try:
@@ -256,9 +247,9 @@ def tool_fetch_url(url: str, max_chars: int = 6000) -> str:
     return text
 
 # Image viewing ------------------------------------------------------
-# view_image just loads the image; the *actual* multimodal understanding
-# happens because we re-inject the referenced image into the next LLM
-# call as vision input. See _build_prompt() below.
+# view_image registers the image; the loop then appends it to the
+# message stream as real vision input, so the model literally sees it
+# on the next forward pass.
 _VIEWED_IMAGES: Dict[str, str] = {}  # tag -> path
 
 def tool_view_image(path: str) -> str:
@@ -273,16 +264,14 @@ def tool_view_image(path: str) -> str:
     tag = f"img_{len(_VIEWED_IMAGES)+1}"
     _VIEWED_IMAGES[tag] = str(p)
     return (f"loaded image '{p.name}' as {tag}  ({w}×{h}). "
-            f"You can now describe or reason about its contents directly — "
-            f"the image is included in your vision context.")
+            f"The image is now in your vision context — describe or reason "
+            f"about its actual contents in your next step.")
 
 # File delivery ------------------------------------------------------
-# The agent calls `deliver_file(path)` when it produces a file. The
-# main event loop watches for these tool calls and, after the loop
-# finishes, presents ALL delivered files via BOTH the Gradio file-
-# output component AND their tempfile.org URLs.
+# deliver_file hands a file back through BOTH a direct download in the
+# chat AND a tempfile.org temporary link, inline in the message stream.
 _DELIVERED: List[Dict[str, Any]] = []
-_TEMPFILE_EXPIRY: int = 1  # updated from the UI dropdown per-run
+_TEMPFILE_EXPIRY: int = DEFAULT_EXPIRY  # set from the Settings accordion
 
 def tool_deliver_file(path: str, description: str = "") -> str:
     p = Path(path).expanduser().resolve()
@@ -300,83 +289,96 @@ def tool_deliver_file(path: str, description: str = "") -> str:
     if up.get("ok"):
         return (f"delivered '{p.name}' ({p.stat().st_size} bytes). "
                 f"Temp link ({up['expiry_hours']}h): {up['url']}  "
-                f"(also available as direct download in the UI)")
+                f"(also attached inline in the chat as a direct download)")
     else:
-        return (f"delivered '{p.name}' ({p.stat().st_size} bytes) as direct "
-                f"download in the UI. tempfile.org upload failed: {up.get('error')}")
+        return (f"delivered '{p.name}' ({p.stat().st_size} bytes) as a direct "
+                f"download in the chat. tempfile.org upload failed: {up.get('error')}")
 
 # ---------------------------------------------------------------------
-# Tool registry — the LLM sees these descriptions verbatim.
+# Tool registry — names + implementations
 # ---------------------------------------------------------------------
 TOOLS: Dict[str, Dict[str, Any]] = {
-    "run_python": {
-        "fn": tool_run_python,
-        "args": ["code"],
-        "desc": "Execute Python code in a persistent notebook-like namespace. "
-                "State (variables, imports) persists between calls. Use this for "
-                "computation, data processing, file manipulation, plotting, etc.",
-    },
-    "run_shell": {
-        "fn": tool_run_shell,
-        "args": ["cmd"],
-        "desc": "Run a shell command in the Colab VM. Full sudo is available. "
-                "Use `pip install …` or `apt-get install -y …` freely to install "
-                "any dependency you need mid-task.",
-    },
-    "read_file": {
-        "fn": tool_read_file,
-        "args": ["path"],
-        "desc": "Read a text file (or list a directory) from the Colab VM.",
-    },
-    "write_file": {
-        "fn": tool_write_file,
-        "args": ["path", "content"],
-        "desc": "Write text content to a file in the Colab VM.",
-    },
-    "view_image": {
-        "fn": tool_view_image,
-        "args": ["path"],
-        "desc": "Load an image so you can look at it directly with your vision "
-                "capabilities. After calling this, you can describe or reason "
-                "about the image in your next thought.",
-    },
-    "web_search": {
-        "fn": tool_web_search,
-        "args": ["query"],
-        "desc": "Search the web (DuckDuckGo). Returns titles + URLs + snippets. "
-                "Use this whenever you need current info or aren't sure of a fact.",
-    },
-    "fetch_url": {
-        "fn": tool_fetch_url,
-        "args": ["url"],
-        "desc": "Fetch a URL and return its readable text content (HTML is "
-                "converted to markdown).",
-    },
-    "deliver_file": {
-        "fn": tool_deliver_file,
-        "args": ["path", "description"],
-        "desc": "Hand a produced file back to the user. This gives them BOTH a "
-                "direct download in the UI AND a temporary tempfile.org link. "
-                "Call this for every output file the user should receive. "
-                "`description` is a one-line human summary of what the file is.",
-    },
-    "final_answer": {
-        "fn": None,   # handled specially
-        "args": ["answer"],
-        "desc": "Emit the final clean answer to the user and stop. Do this once "
-                "the task is complete.",
-    },
+    "run_python": {"fn": tool_run_python, "args": ["code"]},
+    "run_shell": {"fn": tool_run_shell, "args": ["cmd"]},
+    "read_file": {"fn": tool_read_file, "args": ["path"]},
+    "write_file": {"fn": tool_write_file, "args": ["path", "content"]},
+    "view_image": {"fn": tool_view_image, "args": ["path"]},
+    "web_search": {"fn": tool_web_search, "args": ["query"]},
+    "fetch_url": {"fn": tool_fetch_url, "args": ["url"]},
+    "deliver_file": {"fn": tool_deliver_file, "args": ["path", "description"]},
 }
 
-def _tool_descriptions_for_prompt() -> str:
-    out = []
-    for name, spec in TOOLS.items():
-        args = ", ".join(spec["args"])
-        out.append(f"- {name}({args}): {spec['desc']}")
-    return "\n".join(out)
+# OpenAI-style tool schemas for the model's NATIVE tool calling. The
+# chat template renders these into the prompt and parses the model's
+# <tool_call> output back into structured calls — no free-text ReAct.
+TOOL_SCHEMAS: List[Dict[str, Any]] = [
+    {"type": "function", "function": {
+        "name": "run_python",
+        "description": ("Execute Python code in a persistent notebook-like namespace. "
+                        "State (variables, imports) persists between calls. Use this for "
+                        "computation, data processing, file manipulation, plotting, etc."),
+        "parameters": {"type": "object",
+                       "properties": {"code": {"type": "string", "description": "Python source to execute."}},
+                       "required": ["code"]}}},
+    {"type": "function", "function": {
+        "name": "run_shell",
+        "description": ("Run a shell command in the Colab VM. Full sudo is available. "
+                        "Use `pip install …` or `apt-get install -y …` freely to install "
+                        "any dependency you need mid-task."),
+        "parameters": {"type": "object",
+                       "properties": {
+                           "cmd": {"type": "string", "description": "Shell command to run."},
+                           "timeout": {"type": "integer", "description": "Timeout in seconds (default 300)."}},
+                       "required": ["cmd"]}}},
+    {"type": "function", "function": {
+        "name": "read_file",
+        "description": "Read a text file (or list a directory) from the Colab VM.",
+        "parameters": {"type": "object",
+                       "properties": {"path": {"type": "string"}},
+                       "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "write_file",
+        "description": "Write text content to a file in the Colab VM.",
+        "parameters": {"type": "object",
+                       "properties": {"path": {"type": "string"},
+                                      "content": {"type": "string"}},
+                       "required": ["path", "content"]}}},
+    {"type": "function", "function": {
+        "name": "view_image",
+        "description": ("Load an image file so you can look at it directly with your vision "
+                        "capabilities. After calling this, the image enters your vision "
+                        "context and you can describe or reason about its actual contents."),
+        "parameters": {"type": "object",
+                       "properties": {"path": {"type": "string"}},
+                       "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": ("Search the web (DuckDuckGo). Returns titles + URLs + snippets. "
+                        "Use this whenever you need current info or aren't sure of a fact."),
+        "parameters": {"type": "object",
+                       "properties": {"query": {"type": "string"}},
+                       "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "fetch_url",
+        "description": "Fetch a URL and return its readable text content (HTML is converted to markdown).",
+        "parameters": {"type": "object",
+                       "properties": {"url": {"type": "string"}},
+                       "required": ["url"]}}},
+    {"type": "function", "function": {
+        "name": "deliver_file",
+        "description": ("Hand a produced file back to the user. This gives them BOTH a "
+                        "direct download attached inline in the chat AND a temporary "
+                        "tempfile.org link. Call this for every output file the user "
+                        "should receive."),
+        "parameters": {"type": "object",
+                       "properties": {"path": {"type": "string"},
+                                      "description": {"type": "string",
+                                                      "description": "One-line human summary of the file."}},
+                       "required": ["path"]}}},
+]
 
 # ---------------------------------------------------------------------
-# System prompt
+# System prompt — hard behavioral rules
 # ---------------------------------------------------------------------
 SYSTEM_PROMPT = f"""You are **Anvil**, an autonomous tool-using AI agent running
 inside a Google Colab notebook on a {GPU_NAME} GPU with about {VRAM_GB:.0f} GB
@@ -385,93 +387,52 @@ of VRAM. You have full control of the Colab VM: you can install packages
 web, and look at images directly with your own vision.
 
 ## Environment
-- OS: Linux (Colab). Working directory: /content/anvil_workspace.
-- You may install anything you need with `pip install …` or `apt-get install -y …`
-  via the `run_shell` tool — do this proactively when a task needs it, don't
-  ask the user first.
-- You are on a shared GPU. Be mindful of VRAM in code you run (don't load
-  giant models unless the task genuinely requires it).
-- Colab sessions are NOT permanent. Anything the user needs to keep must be
-  delivered back to them via the `deliver_file` tool while the session is live.
-- When you produce a file for the user, ALWAYS call `deliver_file(path)` —
-  do not just leave it in the filesystem. `deliver_file` gives them both a
-  direct download and a temporary tempfile.org link.
+- OS: Linux (Colab). Working directory: {WORKDIR}.
+- You may install anything you need with `pip install …` or
+  `apt-get install -y …` via the `run_shell` tool — do this proactively
+  when a task needs it, without asking the user first.
+- You are on a shared GPU. Be mindful of VRAM in code you run.
+- Colab sessions are NOT permanent. Anything the user needs to keep must
+  be delivered back via the `deliver_file` tool while the session is live.
 
-## How you work — ReAct loop
-Every step you produce EXACTLY ONE of the following, and nothing else:
-
-    Thought: <one short line describing what you're about to do or figure out>
-    Action: <tool_name>
-    Action Input: <JSON object with the tool's arguments>
-
-After each Action, the environment will reply with:
-
-    Observation: <the tool's output>
-
-Then you produce the next Thought / Action / Action Input. Repeat until the
-task is done. To finish, call the special `final_answer` tool:
-
-    Thought: I have everything I need.
-    Action: final_answer
-    Action Input: {{"answer": "…your clean final message to the user…"}}
-
-## Rules
-- Prefer looking things up (`web_search` + `fetch_url`) over guessing.
-- If a package or CLI tool is missing, install it with `run_shell` and continue.
-- Uploaded files (if any) will be listed to you at the start of the task.
-- If the user gave you an image, you may just describe it — the image is
-  already in your vision context. If you want to look at an image you
-  produced or downloaded yourself, call `view_image(path)` first.
-- Keep Thoughts short. Do not dump code inside a Thought — put code in an
-  Action Input for `run_python` or `run_shell`.
-- Action Input MUST be a single valid JSON object on ONE logical line
-  (multi-line strings are fine, but the outer braces must parse as JSON).
-- Do not fabricate Observations. Wait for the real tool result.
-
-## Available tools
-{_tool_descriptions_for_prompt()}
+## Hard rules — these are mandatory, not suggestions
+1. NEVER conclude that a resource, repo, file, or URL does not exist based
+   on a web search alone. Search engines miss things. If the task would be
+   settled by a direct check, DO the direct check: clone it
+   (`run_shell` with `git clone …`), probe it (`git ls-remote`, `curl -I`),
+   or fetch it (`fetch_url`) — then report what the direct check found.
+2. NEVER fabricate, invent, or guess the result of a tool call. You only
+   ever see real tool output, delivered to you as tool-result messages.
+   If you have not called the tool yet, you do not know its result — call
+   it and wait.
+3. If a task needs a CLI tool or library that is not installed (ffmpeg,
+   mpv, imagemagick, yt-dlp, a pip package, …), INSTALL it yourself with
+   `run_shell` and then proceed. "Tool X is not installed" is NEVER an
+   acceptable final answer.
+4. If one tool fails or returns nothing useful, TRY ANOTHER approach
+   before giving up: a different search query, `fetch_url` on a direct
+   URL, `run_shell` with a CLI equivalent, or `run_python`. Give up on a
+   sub-goal only after at least two genuinely different attempts have
+   failed — and say exactly what you tried.
+5. When you produce a file for the user, ALWAYS call `deliver_file(path)`
+   — do not just leave it in the filesystem.
+6. Uploaded files (if any) are listed at the start of the task. An image
+   the user attached is already in your vision context — you may describe
+   it directly. To look at an image you produced or downloaded yourself,
+   call `view_image(path)` first.
+7. When the task is complete, reply to the user with a concise final
+   message and make no further tool calls.
 """
 
 # ---------------------------------------------------------------------
-# Prompt assembly + LLM call
+# LLM call — native tool calling
 # ---------------------------------------------------------------------
-def _build_messages(history_msgs: List[Dict[str, Any]],
-                    user_turn: Dict[str, Any],
-                    scratchpad: str) -> List[Dict[str, Any]]:
-    """
-    Build the qwen-vl chat messages list. Any images uploaded on this
-    turn (or previously view_image'd) are attached as vision inputs to
-    the current user message so the model can literally see them.
-    """
-    msgs: List[Dict[str, Any]] = [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
-    ]
-    msgs.extend(history_msgs)
-
-    content: List[Dict[str, Any]] = []
-    # Images from THIS turn
-    for img_path in user_turn.get("images", []):
-        content.append({"type": "image", "image": img_path})
-    # Images that were view_image'd during the current ReAct loop
-    for _tag, img_path in _VIEWED_IMAGES.items():
-        content.append({"type": "image", "image": img_path})
-
-    prose = user_turn["text"]
-    if user_turn.get("files"):
-        listing = "\n".join(f"  • {f}" for f in user_turn["files"])
-        prose += f"\n\n[The user attached the following files, saved to disk:\n{listing}\n]"
-    if scratchpad:
-        prose += "\n\n" + scratchpad
-
-    content.append({"type": "text", "text": prose})
-    msgs.append({"role": "user", "content": content})
-    return msgs
-
-def _llm_call(messages: List[Dict[str, Any]], stop: List[str]) -> str:
+def _llm_call(messages: List[Dict[str, Any]]) -> str:
     """One forward pass through the model. Returns the newly generated text."""
     from qwen_vl_utils import process_vision_info
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
+        tools=TOOL_SCHEMAS,
     )
     image_inputs, video_inputs = process_vision_info(messages)
     inputs = processor(
@@ -492,191 +453,304 @@ def _llm_call(messages: List[Dict[str, Any]], stop: List[str]) -> str:
             pad_token_id=processor.tokenizer.eos_token_id,
         )
     trimmed = gen[:, inputs.input_ids.shape[1]:]
-    out = processor.batch_decode(trimmed, skip_special_tokens=True,
-                                 clean_up_tokenization_spaces=False)[0]
-
-    # Enforce our own stop strings by truncating.
-    for s in stop:
-        idx = out.find(s)
-        if idx != -1:
-            out = out[:idx]
-    return out.strip()
+    return processor.batch_decode(trimmed, skip_special_tokens=True,
+                                  clean_up_tokenization_spaces=False)[0].strip()
 
 # ---------------------------------------------------------------------
-# ReAct step parsing
+# Native tool-call parsing
 # ---------------------------------------------------------------------
-_STEP_RE = re.compile(
-    r"Thought:\s*(?P<thought>.*?)\s*"
-    r"Action:\s*(?P<action>[a-zA-Z_][a-zA-Z0-9_]*)\s*"
-    r"Action Input:\s*(?P<input>.+?)\s*(?=Observation:|Thought:|\Z)",
-    re.DOTALL,
-)
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 
-def _parse_step(chunk: str) -> Optional[Tuple[str, str, str]]:
-    m = _STEP_RE.search(chunk)
-    if not m:
-        return None
-    thought = m.group("thought").strip()
-    action  = m.group("action").strip()
-    raw_in  = m.group("input").strip()
-    return thought, action, raw_in
 
-def _parse_json_args(raw: str) -> Dict[str, Any]:
-    """
-    Robust-ish JSON arg parsing. Try strict JSON first; if that fails,
-    try to snip the outermost {...} block; finally, treat the raw text
-    as the first positional arg's value.
-    """
-    raw = raw.strip()
-    # strip code fences if the model wrapped it
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-    try:
-        return json.loads(raw)
-    except Exception:
-        pass
-    # try to grab the first balanced {...}
+def _extract_json_block(raw: str) -> Optional[Dict[str, Any]]:
+    """Parse the first balanced {...} block out of a string."""
     start = raw.find("{")
-    end   = raw.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            return json.loads(raw[start:end+1])
-        except Exception:
-            pass
-    return {"_raw": raw}
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(raw)):
+        c = raw[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(raw[start:i + 1])
+                except Exception:
+                    return None
+    return None
+
+
+def _parse_model_output(raw: str) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Split raw model output into (reasoning_text, [tool_calls]).
+    Each tool call is {"id": ..., "name": ..., "arguments": {...}}.
+    Tolerates bare JSON dumps (no <tool_call> wrapper) as a fallback.
+    """
+    calls: List[Dict[str, Any]] = []
+    for m in _TOOL_CALL_RE.finditer(raw):
+        block = _extract_json_block(m.group(1))
+        if block and block.get("name"):
+            args = block.get("arguments") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {"_raw": args}
+            calls.append({"id": f"call_{uuid.uuid4().hex[:8]}",
+                          "name": str(block["name"]),
+                          "arguments": args})
+    reasoning = _TOOL_CALL_RE.sub("", raw).strip()
+
+    if not calls and '"name"' in raw:
+        # Fallback: the model emitted bare tool-call JSON without wrappers.
+        block = _extract_json_block(raw)
+        if block and block.get("name"):
+            args = block.get("arguments") or {}
+            if not isinstance(args, dict):
+                args = {"_raw": str(args)}
+            calls.append({"id": f"call_{uuid.uuid4().hex[:8]}",
+                          "name": str(block["name"]),
+                          "arguments": args})
+            reasoning = raw[:raw.find("{")].strip()
+    return reasoning, calls
+
+
+def _dispatch_tool(name: str, args: Dict[str, Any]) -> str:
+    """Execute one tool call and return its real output as a string."""
+    if name not in TOOLS:
+        return f"[error] unknown tool: {name}. Available: {', '.join(TOOLS)}"
+    spec = TOOLS[name]
+    try:
+        call_args = {}
+        for arg_name in spec["args"]:
+            if arg_name in args:
+                call_args[arg_name] = args[arg_name]
+        # Fallback: if the model dumped a raw string, use it as the
+        # first positional arg.
+        if not call_args and "_raw" in args and spec["args"]:
+            call_args[spec["args"][0]] = args["_raw"]
+        return spec["fn"](**call_args)
+    except Exception as e:
+        return f"[tool error] {type(e).__name__}: {e}"
 
 # ---------------------------------------------------------------------
-# The core streaming ReAct loop
+# UI rendering helpers — everything lives in the chat stream
 # ---------------------------------------------------------------------
-MAX_STEPS = 12
-STOP_TOKENS = ["Observation:"]
+def _preview(text: str, n: int = 160) -> str:
+    text = " ".join((text or "").split())
+    return text[:n] + ("…" if len(text) > n else "")
+
+
+def _tool_title(name: str, args: Dict[str, Any], result: Optional[str]) -> str:
+    arg_bits = ", ".join(f"{k}={_preview(str(v), 40)!r}" for k, v in list(args.items())[:2])
+    title = f"🛠 {name}({arg_bits})"
+    if result is not None:
+        title += f" → {_preview(result, 80)}"
+    return title
+
+
+def _tool_body(name: str, args: Dict[str, Any], result: Optional[str]) -> str:
+    parts = [f"**arguments**\n```json\n{json.dumps(args, ensure_ascii=False, indent=2)[:2000]}\n```"]
+    if result is not None:
+        parts.append(f"**result**\n```\n{result[:3000]}\n```")
+    else:
+        parts.append("*running…*")
+    return "\n\n".join(parts)
+
+
+def _render_tool_event(evt: Dict[str, Any]) -> Dict[str, Any]:
+    """A tool call as one collapsible chat entry (metadata title = header)."""
+    return {
+        "role": "assistant",
+        "content": _tool_body(evt["name"], evt["args"], evt.get("result")),
+        "metadata": {"title": _tool_title(evt["name"], evt["args"], evt.get("result"))},
+    }
+
+
+def _render_reasoning(text: str) -> Dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": text,
+        "metadata": {"title": f"💭 {_preview(text, 90)}"},
+    }
+
+
+def _render_file_delivery(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """A delivered file as an inline chat attachment with the temp link."""
+    caption_lines = [f"**{rec['name']}** ({rec['size']:,} bytes)"]
+    if rec.get("description"):
+        caption_lines.append(rec["description"])
+    up = rec.get("tempfile") or {}
+    if up.get("ok"):
+        caption_lines.append(f"🔗 [tempfile.org link]({up['url']}) — expires in {up['expiry_hours']}h")
+    else:
+        caption_lines.append(f"*(tempfile.org link unavailable: {up.get('error', 'n/a')})*")
+    return {
+        "role": "assistant",
+        "content": {
+            "path": rec["path"],
+            "alt_text": "\n".join(caption_lines),
+        },
+        "metadata": {"title": f"📎 Delivered: {rec['name']}"},
+    }
+
+
+def _ui_append(ui_events: List[Dict[str, Any]], msg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return ui_events + [msg]
+
+
+# ---------------------------------------------------------------------
+# The core streaming agent loop (native tool calling)
+# ---------------------------------------------------------------------
+MAX_STEPS = 24
+
 
 def agent_stream(user_text: str,
                  uploaded_paths: List[str],
                  history_msgs: List[Dict[str, Any]],
                  expiry_hours: int
-                 ) -> Generator[Tuple[str, str, List[str], List[Dict[str, Any]]], None, None]:
+                 ) -> Generator[Tuple[List[Dict[str, Any]], Optional[str], List[Dict[str, Any]]], None, None]:
     """
-    Yields (thought_log_markdown, final_answer_or_empty, delivered_paths,
-    updated_history_msgs) as the agent runs. When final_answer_or_empty
-    is non-empty the loop is done.
+    Yields (ui_events, final_answer_or_None, updated_agent_history).
+    ui_events are chat messages to append after the user's message:
+    reasoning blocks, collapsible tool calls, inline file attachments,
+    and finally the assistant's reply.
     """
     global _DELIVERED, _VIEWED_IMAGES, _TEMPFILE_EXPIRY
     _DELIVERED = []
     _VIEWED_IMAGES = {}
-    _TEMPFILE_EXPIRY = expiry_hours if expiry_hours in VALID_EXPIRY else 1
+    _TEMPFILE_EXPIRY = expiry_hours if expiry_hours in VALID_EXPIRY else DEFAULT_EXPIRY
 
     # Sort uploads into images vs everything else — images go into vision.
-    image_paths, other_files = [], []
+    image_paths = []
     for p in uploaded_paths:
         mime, _ = mimetypes.guess_type(p)
         if (mime or "").startswith("image/"):
             image_paths.append(p)
-        else:
-            other_files.append(p)
 
-    user_turn = {
-        "text":   user_text,
-        "images": image_paths,
-        "files":  uploaded_paths,
-    }
+    content: List[Dict[str, Any]] = []
+    for img_path in image_paths:
+        content.append({"type": "image", "image": img_path})
+    prose = user_text
+    if uploaded_paths:
+        listing = "\n".join(f"  • {f}" for f in uploaded_paths)
+        prose += f"\n\n[The user attached the following files, saved to disk:\n{listing}\n]"
+    content.append({"type": "text", "text": prose})
 
-    log_lines: List[str] = []
-    def log(line: str):
-        log_lines.append(line)
-        return "\n".join(log_lines)
+    # The live conversation for the model: real roles, real tool results.
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+        *history_msgs,
+        {"role": "user", "content": content},
+    ]
 
-    yield log("▸ Thinking about how to approach this…"), "", [], history_msgs
+    ui_events: List[Dict[str, Any]] = []
+    delivered_this_turn: List[Dict[str, Any]] = []
 
-    scratchpad = ""
     for step_i in range(1, MAX_STEPS + 1):
-        messages = _build_messages(history_msgs, user_turn, scratchpad)
         try:
-            raw = _llm_call(messages, stop=STOP_TOKENS)
+            raw = _llm_call(messages)
         except Exception as e:
-            err = f"[LLM error] {type(e).__name__}: {e}\n{traceback.format_exc(limit=2)}"
-            yield log(f"❌ {err}"), err, [], history_msgs
+            err = f"❌ LLM error: {type(e).__name__}: {e}"
+            ui_events = _ui_append(ui_events, {"role": "assistant", "content": err})
+            yield ui_events, None, history_msgs
             return
 
-        parsed = _parse_step(raw)
-        if not parsed:
-            # Model produced free text instead of a proper step — accept
-            # it as the final answer and stop.
-            final = raw.strip() or "(the model produced no answer)"
-            yield log("✔ done"), final, [d["path"] for d in _DELIVERED], history_msgs + [
-                {"role": "user",      "content": [{"type": "text", "text": user_text}]},
+        reasoning, calls = _parse_model_output(raw)
+
+        # ---------------------- no tool calls → final answer
+        if not calls:
+            final = (reasoning or raw or "(the model produced no answer)").strip()
+            ui_events = _ui_append(ui_events, {"role": "assistant", "content": final})
+            new_history = history_msgs + [
+                {"role": "user", "content": content},
                 {"role": "assistant", "content": [{"type": "text", "text": final}]},
             ]
+            yield ui_events, final, new_history
             return
 
-        thought, action, raw_input = parsed
-        args = _parse_json_args(raw_input)
+        # ---------------------- record the reasoning inline, where it happened
+        if reasoning:
+            ui_events = _ui_append(ui_events, _render_reasoning(reasoning))
 
-        # Log the thought + intended action to the UI.
-        pretty_args = json.dumps(args, ensure_ascii=False)
-        if len(pretty_args) > 240:
-            pretty_args = pretty_args[:240] + "…"
-        yield (log(f"💭 {thought}"), "", [d['path'] for d in _DELIVERED], history_msgs)
-        yield (log(f"🔧 Calling tool: `{action}` {pretty_args}"), "",
-               [d['path'] for d in _DELIVERED], history_msgs)
+        # Append the assistant turn (with its tool calls) to the model convo.
+        messages.append({
+            "role": "assistant",
+            "content": ([{"type": "text", "text": reasoning}] if reasoning else []),
+            "tool_calls": [
+                {"id": c["id"], "type": "function",
+                 "function": {"name": c["name"],
+                              "arguments": json.dumps(c["arguments"], ensure_ascii=False)}}
+                for c in calls
+            ],
+        })
 
-        # -------------------- final_answer short-circuit
-        if action == "final_answer":
-            final = args.get("answer") or args.get("_raw") or ""
-            yield (log("✔ done"), final,
-                   [d["path"] for d in _DELIVERED],
-                   history_msgs + [
-                       {"role": "user",      "content": [{"type": "text", "text": user_text}]},
-                       {"role": "assistant", "content": [{"type": "text", "text": final}]},
-                   ])
-            return
+        # ---------------------- execute each tool call, stream results inline
+        tool_result_msgs: List[Dict[str, Any]] = []
+        for call in calls:
+            evt = {"name": call["name"], "args": call["arguments"], "result": None}
+            rendered = _render_tool_event(evt)
+            ui_events = _ui_append(ui_events, rendered)
+            yield ui_events, None, history_msgs  # show the call as "running…"
 
-        # -------------------- dispatch
-        if action not in TOOLS:
-            observation = f"[error] unknown tool: {action}"
-        else:
-            spec = TOOLS[action]
-            fn = spec["fn"]
-            try:
-                call_args = {}
-                for name in spec["args"]:
-                    if name in args:
-                        call_args[name] = args[name]
-                # Fallback: if the model dumped a raw string, use it as
-                # the first positional arg.
-                if not call_args and "_raw" in args and spec["args"]:
-                    call_args[spec["args"][0]] = args["_raw"]
-                observation = fn(**call_args) if fn else "[error] no impl"
-            except Exception as e:
-                observation = f"[tool error] {type(e).__name__}: {e}"
+            result = _dispatch_tool(call["name"], call["arguments"])
 
-        # Log the observation (truncated) to the UI.
-        obs_preview = observation.strip().splitlines()
-        if obs_preview:
-            head = obs_preview[0][:200]
-            more = "" if len(obs_preview) <= 1 else f"  (+{len(obs_preview)-1} more lines)"
-            yield (log(f"📄 {head}{more}"), "",
-                   [d["path"] for d in _DELIVERED], history_msgs)
+            evt["result"] = result
+            ui_events[-1] = _render_tool_event(evt)  # update in place with the result
+            tool_result_msgs.append({
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "name": call["name"],
+                "content": [{"type": "text", "text": result}],
+            })
 
-        # Append this step to the scratchpad for the next LLM call.
-        scratchpad += (
-            f"\nThought: {thought}\n"
-            f"Action: {action}\n"
-            f"Action Input: {json.dumps(args, ensure_ascii=False)}\n"
-            f"Observation: {observation}\n"
-        )
+            # If a file was delivered, attach it inline right here.
+            if call["name"] == "deliver_file" and _DELIVERED:
+                rec = _DELIVERED[-1]
+                if rec not in delivered_this_turn:
+                    delivered_this_turn.append(rec)
+                    ui_events = _ui_append(ui_events, _render_file_delivery(rec))
 
-    # Loop exhausted without final_answer.
-    final = ("I ran out of reasoning steps before finishing this task. "
-             "Here's what I did so far — you may want to ask a narrower "
-             "follow-up.\n\n" + scratchpad[-2000:])
-    yield (log("⚠ max steps reached"), final,
-           [d["path"] for d in _DELIVERED],
-           history_msgs + [
-               {"role": "user",      "content": [{"type": "text", "text": user_text}]},
-               {"role": "assistant", "content": [{"type": "text", "text": final}]},
-           ])
+            yield ui_events, None, history_msgs
+
+        # Feed the REAL tool results back to the model. The agent can
+        # never fabricate an Observation — these are genuine outputs.
+        messages.extend(tool_result_msgs)
+
+        # If view_image ran, inject the image(s) as real vision input.
+        new_imgs = [p for p in _VIEWED_IMAGES.values()
+                    if not any(p in json.dumps(m, default=str) for m in messages[:-len(tool_result_msgs)])]
+        if new_imgs:
+            img_content: List[Dict[str, Any]] = [{"type": "image", "image": p} for p in new_imgs]
+            img_content.append({"type": "text",
+                                "text": "[The image(s) you loaded with view_image are above. "
+                                        "Describe what you actually see.]"})
+            messages.append({"role": "user", "content": img_content})
+
+    # Loop exhausted.
+    final = ("I hit the step limit before finishing. Here's where I got to — "
+             "ask a narrower follow-up and I'll continue from here.")
+    ui_events = _ui_append(ui_events, {"role": "assistant", "content": final})
+    new_history = history_msgs + [
+        {"role": "user", "content": content},
+        {"role": "assistant", "content": [{"type": "text", "text": final}]},
+    ]
+    yield ui_events, final, new_history
+
 
 # ---------------------------------------------------------------------
 # Gradio glue
@@ -699,44 +773,31 @@ def _copy_uploads(files) -> List[str]:
             pass
     return saved
 
-def _format_delivered_summary(delivered: List[Dict[str, Any]]) -> str:
-    if not delivered:
-        return ""
-    lines = ["", "---", "**📎 Files delivered:**"]
-    for d in delivered:
-        line = f"- `{d['name']}` ({d['size']:,} bytes)"
-        if d.get("description"):
-            line += f" — {d['description']}"
-        up = d.get("tempfile") or {}
-        if up.get("ok"):
-            line += f"  \n  🔗 [{up['url']}]({up['url']}) *(expires in {up['expiry_hours']}h)*"
-        else:
-            line += f"  \n  *(tempfile.org upload skipped: {up.get('error','n/a')} — use the direct download below)*"
-        lines.append(line)
-    return "\n".join(lines)
 
-def _initial_history() -> List[Dict[str, Any]]:
-    return []
+def _expiry_from_label(label: str) -> int:
+    try:
+        val = int(str(label).split()[0])
+        return val if val in VALID_EXPIRY else DEFAULT_EXPIRY
+    except Exception:
+        return DEFAULT_EXPIRY
+
 
 # ---------- Gradio callback (a generator, for live streaming) ----------
 def on_submit(user_msg: str,
               files,
               expiry_choice: str,
-              chat_history: List[Dict[str, str]],
+              chat_history,
               agent_history: List[Dict[str, Any]]):
-    """
-    Gradio streaming handler. Yields updates to:
-      (chatbot, thought_log, file_output, agent_history_state, uploads_state, input_box)
-    """
+    """Streaming handler. Yields updates to
+    (chatbot, agent_history_state, file_input, input_box)."""
     user_msg = (user_msg or "").strip()
     uploads = _copy_uploads(files)
     if not uploads:
         uploads = [str(Path(p)) for p in getattr(builtins, "ANVIL_FILES", [])
                    if Path(p).exists()]
     if not user_msg and not uploads:
-        yield chat_history, "*(nothing to do)*", [], agent_history, None, ""
+        yield chat_history, agent_history, None, ""
         return
-
     if not user_msg and uploads:
         user_msg = "(no text — please look at the uploaded file(s) and decide what to do.)"
 
@@ -744,106 +805,123 @@ def on_submit(user_msg: str,
     display_user = user_msg
     if uploads:
         display_user += "\n\n" + "\n".join(f"📎 `{Path(p).name}`" for p in uploads)
-    chat_history = _chatbot_history_add_turn(chat_history, display_user)
-    yield chat_history, "▸ Starting…", [], agent_history, None, ""
 
-    expiry = int(expiry_choice.split()[0]) if expiry_choice else 1
+    if _CHATBOT_USES_MESSAGES:
+        chat_history = chat_history + [{"role": "user", "content": display_user}]
+    else:
+        chat_history = chat_history + [[display_user, None]]
+    yield chat_history, agent_history, None, ""
 
-    final_answer = ""
-    delivered_paths: List[str] = []
-    last_log = ""
+    expiry = _expiry_from_label(expiry_choice)
     new_agent_history = agent_history
 
-    for log_md, final, dpaths, hist in agent_stream(
-            user_msg, uploads, agent_history, expiry):
-        last_log = log_md
-        _chatbot_history_set_assistant(chat_history, final or "*thinking…*")
-        yield chat_history, last_log, dpaths, hist, None, ""
-        if final:
-            final_answer = final
-            delivered_paths = dpaths
+    for ui_events, final, hist in agent_stream(user_msg, uploads, agent_history, expiry):
+        if _CHATBOT_USES_MESSAGES:
+            visible = chat_history + ui_events
+        else:
+            # Legacy tuple fallback: flatten events into text.
+            lines = []
+            for ev in ui_events:
+                title = (ev.get("metadata") or {}).get("title", "")
+                body = ev.get("content")
+                if isinstance(body, dict):
+                    body = body.get("alt_text", "")
+                lines.append(f"{title}\n{body}" if title else str(body))
+            visible = chat_history[:-1] + [[chat_history[-1][0], "\n\n".join(lines)]]
+        yield visible, hist, None, ""
+        if final is not None:
             new_agent_history = hist
 
-    # Compose the final chat message with a summary of delivered files.
-    summary = _format_delivered_summary(_DELIVERED)
-    _chatbot_history_set_assistant(chat_history, (final_answer or "(no answer)") + summary)
-    yield chat_history, last_log + "\n\n**✅ Finished.**", delivered_paths, new_agent_history, None, ""
+    yield chat_history, new_agent_history, None, ""
+
 
 # ---------------------------------------------------------------------
-# Simple cell UI
+# UI
 # ---------------------------------------------------------------------
+_CSS = """
+.gradio-container { max-width: 900px !important; margin: auto !important; }
+#anvil-chatbot { border: 1px solid #e4e4e7; border-radius: 12px; }
+footer { display: none !important; }
+"""
+
 
 def launch():
-    with gr.Blocks() as demo:
-        gr.Markdown("## Anvil")
-        gr.Markdown("Ask a question, attach files if needed, and press Send.")
+    with gr.Blocks(css=_CSS, title="Anvil") as demo:
+        gr.Markdown("## ⚒️ Anvil")
 
         agent_hist_state = gr.State([])
-        uploads_state = gr.State([])
 
         chatbot_params = {
             "type": "messages",
-            "height": 500,
+            "height": 560,
             "show_label": False,
             "show_copy_button": True,
             "render_markdown": True,
             "value": _chatbot_history_initial(),
+            "elem_id": "anvil-chatbot",
         }
-        chatbot_signature = inspect.signature(gr.Chatbot.__init__).parameters
         chatbot = gr.Chatbot(**{
-            key: value for key, value in chatbot_params.items()
-            if key in chatbot_signature
+            k: v for k, v in chatbot_params.items() if k in _CHATBOT_PARAMETERS
         })
 
-        input_box = gr.Textbox(
-            label="Message",
-            placeholder="What would you like Anvil to do?",
-            lines=3,
-        )
-        file_input = gr.File(
-            label="Attachments",
-            file_count="multiple",
-        )
-        expiry_dd = gr.Dropdown(
-            choices=["1 hour", "6 hours", "24 hours", "48 hours"],
-            value="1 hour",
-            label="Download link expiry",
-        )
+        if _HAS_MULTIMODAL_TEXTBOX:
+            input_box = gr.MultimodalTextbox(
+                placeholder="What would you like Anvil to do? Attach files with 📎",
+                file_count="multiple",
+                show_label=False,
+                submit_btn=True,
+            )
+            file_input = None
+        else:
+            input_box = gr.Textbox(
+                placeholder="What would you like Anvil to do?",
+                lines=2, show_label=False,
+            )
+            file_input = gr.File(label="Attachments", file_count="multiple")
 
-        with gr.Row():
-            send_btn = gr.Button("Send", variant="primary")
-            clear_btn = gr.Button("Clear")
+        with gr.Accordion("Settings", open=False):
+            expiry_dd = gr.Dropdown(
+                choices=[f"{h} hours" for h in VALID_EXPIRY],
+                value=f"{DEFAULT_EXPIRY} hours",
+                label="Temp-file link expiry",
+            )
 
-        thought_log = gr.Markdown("Idle.", label="Activity")
-        file_output = gr.File(label="Downloads", file_count="multiple", interactive=False)
+        def _unpack(msg_value):
+            """MultimodalTextbox returns {'text': ..., 'files': [...]}."""
+            if isinstance(msg_value, dict):
+                return msg_value.get("text", ""), msg_value.get("files", [])
+            return msg_value or "", None
 
-        submit_kwargs = dict(
-            fn=on_submit,
-            inputs=[input_box, file_input, expiry_dd, chatbot, agent_hist_state],
-            outputs=[chatbot, thought_log, file_output, agent_hist_state, file_input, input_box],
-        )
-        send_btn.click(**submit_kwargs)
-        input_box.submit(**submit_kwargs)
+        def _submit_norm(msg_value, files, expiry, chat, agent_hist):
+            text, mm_files = _unpack(msg_value)
+            all_files = list(mm_files or []) + list(files or [])
+            for chat_out, hist_out, _f, _t in on_submit(text, all_files, expiry, chat, agent_hist):
+                if file_input is None:
+                    yield chat_out, hist_out, {"text": "", "files": []}
+                else:
+                    yield chat_out, hist_out, None, ""
+
+        if file_input is None:
+            input_box.submit(_submit_norm,
+                             inputs=[input_box, expiry_dd, chatbot, agent_hist_state],
+                             outputs=[chatbot, agent_hist_state, input_box])
+        else:
+            input_box.submit(_submit_norm,
+                             inputs=[input_box, file_input, expiry_dd, chatbot, agent_hist_state],
+                             outputs=[chatbot, agent_hist_state, file_input, input_box])
 
         def _clear():
-            return _chatbot_history_initial(), "Idle.", [], []
+            return _chatbot_history_initial(), []
 
-        clear_btn.click(
-            _clear,
-            outputs=[chatbot, thought_log, file_output, agent_hist_state],
-        )
+        chatbot.clear(_clear, outputs=[chatbot, agent_hist_state])
 
     print(f"Launching Anvil. Model: {MODEL_ID}. GPU: {GPU_NAME}.")
     try:
         queued_demo = demo.queue(default_concurrency_limit=1)
     except TypeError:
         queued_demo = demo.queue()
-    queued_demo.launch(
-        share=True,
-        debug=False,
-        inline=True,
-        show_error=True,
-    )
+    queued_demo.launch(share=True, debug=False, inline=True, show_error=True)
+
 
 if __name__ == "__main__":
     launch()
