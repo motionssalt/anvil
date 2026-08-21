@@ -50,6 +50,36 @@ WORKDIR.mkdir(parents=True, exist_ok=True)
 os.chdir(WORKDIR)
 
 # ---------------------------------------------------------------------
+# Gradio compatibility
+# ---------------------------------------------------------------------
+# Gradio 4/5 commonly supports Chatbot(type="messages"), while some
+# Colab runtimes ship a newer or older Chatbot API. Keep the UI and
+# callback history format aligned with the installed constructor.
+import inspect
+
+_CHATBOT_SUPPORTS_MESSAGES = "type" in inspect.signature(gr.Chatbot.__init__).parameters
+
+def _chatbot_history_initial():
+    if _CHATBOT_SUPPORTS_MESSAGES:
+        return [{"role": "assistant", "content": "Anvil is ready."}]
+    return [[None, "Anvil is ready."]]
+
+def _chatbot_history_add_turn(history, user_text):
+    if _CHATBOT_SUPPORTS_MESSAGES:
+        return history + [
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": "*thinking…*"},
+        ]
+    return history + [[user_text, "*thinking…*"]]
+
+def _chatbot_history_set_assistant(history, text):
+    if _CHATBOT_SUPPORTS_MESSAGES:
+        history[-1] = {"role": "assistant", "content": text}
+    else:
+        history[-1][1] = text
+    return history
+
+# ---------------------------------------------------------------------
 # TempFile.org uploader — verified against https://tempfile.org/api
 # ---------------------------------------------------------------------
 TEMPFILE_API   = "https://tempfile.org/api/upload/local"
@@ -705,10 +735,7 @@ def on_submit(user_msg: str,
     display_user = user_msg
     if uploads:
         display_user += "\n\n" + "\n".join(f"📎 `{Path(p).name}`" for p in uploads)
-    chat_history = chat_history + [
-        {"role": "user", "content": display_user},
-        {"role": "assistant", "content": "*thinking…*"},
-    ]
+    chat_history = _chatbot_history_add_turn(chat_history, display_user)
     yield chat_history, "▸ Starting…", [], agent_history, None, ""
 
     expiry = int(expiry_choice.split()[0]) if expiry_choice else 1
@@ -721,8 +748,7 @@ def on_submit(user_msg: str,
     for log_md, final, dpaths, hist in agent_stream(
             user_msg, uploads, agent_history, expiry):
         last_log = log_md
-        chat_history[-1] = {"role": "assistant",
-                            "content": final or "*thinking…*"}
+        _chatbot_history_set_assistant(chat_history, final or "*thinking…*")
         yield chat_history, last_log, dpaths, hist, None, ""
         if final:
             final_answer = final
@@ -731,10 +757,7 @@ def on_submit(user_msg: str,
 
     # Compose the final chat message with a summary of delivered files.
     summary = _format_delivered_summary(_DELIVERED)
-    chat_history[-1] = {
-        "role": "assistant",
-        "content": (final_answer or "(no answer)") + summary,
-    }
+    _chatbot_history_set_assistant(chat_history, (final_answer or "(no answer)") + summary)
     yield chat_history, last_log + "\n\n**✅ Finished.**", delivered_paths, new_agent_history, None, ""
 
 # ---------------------------------------------------------------------
@@ -749,14 +772,19 @@ def launch():
         agent_hist_state = gr.State([])
         uploads_state = gr.State([])
 
-        chatbot = gr.Chatbot(
-            type="messages",
-            height=500,
-            show_label=False,
-            show_copy_button=True,
-            render_markdown=True,
-            value=[{"role": "assistant", "content": "Anvil is ready."}],
-        )
+        chatbot_params = {
+            "type": "messages",
+            "height": 500,
+            "show_label": False,
+            "show_copy_button": True,
+            "render_markdown": True,
+            "value": _chatbot_history_initial(),
+        }
+        chatbot_signature = inspect.signature(gr.Chatbot.__init__).parameters
+        chatbot = gr.Chatbot(**{
+            key: value for key, value in chatbot_params.items()
+            if key in chatbot_signature
+        })
 
         input_box = gr.Textbox(
             label="Message",
@@ -789,7 +817,7 @@ def launch():
         input_box.submit(**submit_kwargs)
 
         def _clear():
-            return [{"role": "assistant", "content": "Anvil is ready."}], "Idle.", [], []
+            return _chatbot_history_initial(), "Idle.", [], []
 
         clear_btn.click(
             _clear,
@@ -797,7 +825,11 @@ def launch():
         )
 
     print(f"Launching Anvil. Model: {MODEL_ID}. GPU: {GPU_NAME}.")
-    demo.queue(default_concurrency_limit=1).launch(
+    try:
+        queued_demo = demo.queue(default_concurrency_limit=1)
+    except TypeError:
+        queued_demo = demo.queue()
+    queued_demo.launch(
         share=True,
         debug=False,
         inline=True,
