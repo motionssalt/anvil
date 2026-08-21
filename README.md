@@ -1,10 +1,23 @@
 # Anvil
 
-**A two-cell autonomous agent for Google Colab, with its implementation in reusable Python files.**
+**A compact, polished four-cell autonomous agent for Google Colab, backed by maintainable Python files.**
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/motionssalt/anvil/blob/main/anvil.ipynb)
 
-Anvil turns a Colab GPU runtime into a persistent, tool-using AI agent with a Gradio chat and file-upload interface. The notebook is intentionally a thin launcher: the actual setup and agent implementation live under `src/anvil/`, so they can be imported, tested, run from the command line, and maintained without editing a giant notebook cell.
+Anvil turns a Colab GPU runtime into a persistent, tool-using AI agent with a Gradio chat and file-upload interface. Like the MOTIONSALT Upscaler notebook, the visible notebook is intentionally compact: each cell has a clean Colab form title, implementation details remain hidden behind **Show code**, and the actual agent logic lives in `src/anvil/`.
+
+## The Colab experience
+
+Run the four cells from top to bottom. The notebook presents the workflow as four compact cards:
+
+| Cell | What it does |
+| --- | --- |
+| **Connect** | Creates the workspace, downloads the repository when needed, installs dependencies, checks the GPU, and loads the model with a polished progress card. |
+| **Upload a file** | Provides a compact file picker for images, documents, data, audio, and video. Selected files are made available to the agent. |
+| **Chat with Anvil** | Launches the Gradio chat, live thought-process pane, attachment support, and generated-file downloads. |
+| **Download** | Gives a clean reminder that generated files are available from the chat’s Downloads panel. |
+
+The notebook itself contains only short wrapper cells. Users can leave every cell collapsed and interact with the rendered cards, exactly as in the reference Upscaler notebook.
 
 ## Repository layout
 
@@ -13,12 +26,8 @@ Anvil turns a Colab GPU runtime into a persistent, tool-using AI agent with a Gr
 | `src/anvil/setup.py` | Dependency installation, GPU checks, model loading, and runtime state. |
 | `src/anvil/agent.py` | Tool implementations, ReAct loop, Gradio callbacks, and UI launcher. |
 | `scripts/run_anvil.py` | Non-notebook entry point that sets up and launches Anvil. |
-| `anvil.ipynb` | Small Colab wrapper that imports the Python modules. |
+| `anvil.ipynb` | Compact four-cell Colab wrapper with form-cell metadata and progress/file-picker UI. |
 | `requirements.txt` | Runtime dependencies. |
-
-## Run in Colab
-
-Open the notebook, select a GPU runtime, and run the two cells from top to bottom. The first cell installs the local package and loads the model; the second launches the Gradio interface.
 
 ## Run from a GPU VM
 
@@ -28,3 +37,7 @@ python scripts/run_anvil.py
 ```
 
 The default model is `Qwen/Qwen2.5-VL-7B-Instruct` loaded in 4-bit mode for a free-tier T4. The agent provides Python and shell execution, file I/O, image viewing, web search/fetch, and dual-mode file delivery through the Gradio UI.
+
+## Notes
+
+The first notebook cell clones the repository into `/content/anvil` when the source files are not already present, so the notebook works when opened directly from GitHub in Colab. The implementation is kept outside the notebook so it can be imported, tested, and run from the command line without turning the notebook into a wall of raw source code.
