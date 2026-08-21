@@ -589,9 +589,37 @@ def _render_reasoning(text: str) -> Dict[str, Any]:
     }
 
 
-def _render_file_delivery(rec: Dict[str, Any]) -> Dict[str, Any]:
-    """A delivered file as an inline chat attachment with the temp link."""
-    caption_lines = [f"**{rec['name']}** ({rec['size']:,} bytes)"]
+def _render_file_delivery(rec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """A delivered file as an inline chat attachment with the temp link.
+
+    Returns TWO messages (both contract violations lived here, and the
+    split fixes each):
+
+    1. caption message — plain text content carrying the filename, size,
+       description and tempfile.org link. Text content is valid on every
+       messages-format Gradio version. (Previously this caption lived in
+       the ``alt_text`` of a raw ``{"path": ..., "alt_text": ...}`` dict
+       used as message ``content`` — a shape the messages-format Chatbot
+       does not guarantee: ``_postprocess_content`` only explicitly
+       handles ``str`` / ``FileData`` / ``GradioComponent`` /
+       ``(path, alt_text)`` tuples, and in several 4.x versions a raw
+       dict falls through and postprocessing yields ``None`` for the
+       message, which surfaces downstream as
+       ``Value after * must be an iterable, not NoneType``.)
+
+    2. attachment message — ``content`` is a ``gr.FileData`` object (the
+       documented, version-stable file-content shape; handled via an
+       explicit ``isinstance(chat_message, FileData)`` branch in
+       ``Chatbot._postprocess_content`` across the 4.x/5.x/6.x line) and
+       carries NO ``metadata``. Previously the same message combined
+       file content with ``metadata={"title": ...}``; in Gradio's
+       messages format ``metadata`` is the collapsible-header mechanism
+       intended for text messages, and combining it with file content is
+       version-dependent and can silently fail postprocessing (again a
+       ``None`` message downstream). No functionality is lost: the
+       caption message above shows everything the metadata title showed.
+    """
+    caption_lines = [f"📎 **Delivered: {rec['name']}** ({rec['size']:,} bytes)"]
     if rec.get("description"):
         caption_lines.append(rec["description"])
     up = rec.get("tempfile") or {}
@@ -599,14 +627,20 @@ def _render_file_delivery(rec: Dict[str, Any]) -> Dict[str, Any]:
         caption_lines.append(f"🔗 [tempfile.org link]({up['url']}) — expires in {up['expiry_hours']}h")
     else:
         caption_lines.append(f"*(tempfile.org link unavailable: {up.get('error', 'n/a')})*")
-    return {
+    caption_msg = {
         "role": "assistant",
-        "content": {
-            "path": rec["path"],
-            "alt_text": "\n".join(caption_lines),
-        },
-        "metadata": {"title": f"📎 Delivered: {rec['name']}"},
+        "content": "\n".join(caption_lines),
     }
+    attachment_msg = {
+        "role": "assistant",
+        "content": gr.FileData(
+            path=rec["path"],
+            orig_name=rec["name"],
+            size=rec.get("size"),
+            mime_type=mimetypes.guess_type(rec["path"])[0],
+        ),
+    }
+    return [caption_msg, attachment_msg]
 
 
 def _ui_append(ui_events: List[Dict[str, Any]], msg: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -723,7 +757,9 @@ def agent_stream(user_text: str,
                 rec = _DELIVERED[-1]
                 if rec not in delivered_this_turn:
                     delivered_this_turn.append(rec)
-                    ui_events = _ui_append(ui_events, _render_file_delivery(rec))
+                    # _render_file_delivery now returns a list of messages
+                    # (text caption + clean file attachment).
+                    ui_events = ui_events + _render_file_delivery(rec)
 
             yield ui_events, None, history_msgs
 
@@ -826,6 +862,8 @@ def on_submit(user_msg: str,
                 body = ev.get("content")
                 if isinstance(body, dict):
                     body = body.get("alt_text", "")
+                elif isinstance(body, gr.FileData):
+                    body = f"📎 {body.orig_name or Path(body.path).name}"
                 lines.append(f"{title}\n{body}" if title else str(body))
             visible = chat_history[:-1] + [[chat_history[-1][0], "\n\n".join(lines)]]
         yield visible, hist, None, ""
