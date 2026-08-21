@@ -57,15 +57,24 @@ os.chdir(WORKDIR)
 # callback history format aligned with the installed constructor.
 import inspect
 
-_CHATBOT_SUPPORTS_MESSAGES = "type" in inspect.signature(gr.Chatbot.__init__).parameters
+_CHATBOT_PARAMETERS = inspect.signature(gr.Chatbot.__init__).parameters
+_CHATBOT_SUPPORTS_TYPE = "type" in _CHATBOT_PARAMETERS
+try:
+    _GRADIO_MAJOR = int(str(getattr(gr, "__version__", "0")).split(".")[0])
+except (TypeError, ValueError):
+    _GRADIO_MAJOR = 0
+# Gradio 5/6 removed or changed the constructor keyword but require
+# messages dictionaries. Older Gradio 3/4 runtimes use tuple history.
+_CHATBOT_USES_MESSAGES = _CHATBOT_SUPPORTS_TYPE or _GRADIO_MAJOR >= 5
+
 
 def _chatbot_history_initial():
-    if _CHATBOT_SUPPORTS_MESSAGES:
+    if _CHATBOT_USES_MESSAGES:
         return [{"role": "assistant", "content": "Anvil is ready."}]
     return [[None, "Anvil is ready."]]
 
 def _chatbot_history_add_turn(history, user_text):
-    if _CHATBOT_SUPPORTS_MESSAGES:
+    if _CHATBOT_USES_MESSAGES:
         return history + [
             {"role": "user", "content": user_text},
             {"role": "assistant", "content": "*thinking…*"},
@@ -73,7 +82,7 @@ def _chatbot_history_add_turn(history, user_text):
     return history + [[user_text, "*thinking…*"]]
 
 def _chatbot_history_set_assistant(history, text):
-    if _CHATBOT_SUPPORTS_MESSAGES:
+    if _CHATBOT_USES_MESSAGES:
         history[-1] = {"role": "assistant", "content": text}
     else:
         history[-1][1] = text
