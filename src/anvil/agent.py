@@ -691,6 +691,9 @@ def on_submit(user_msg: str,
     """
     user_msg = (user_msg or "").strip()
     uploads = _copy_uploads(files)
+    if not uploads:
+        uploads = [str(Path(p)) for p in getattr(builtins, "ANVIL_FILES", [])
+                   if Path(p).exists()]
     if not user_msg and not uploads:
         yield chat_history, "*(nothing to do)*", [], agent_history, None, ""
         return
