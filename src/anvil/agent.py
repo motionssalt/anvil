@@ -884,7 +884,7 @@ footer { display: none !important; }
 
 
 def launch():
-    with gr.Blocks(css=_CSS, title="Anvil") as demo:
+    with gr.Blocks(title="Anvil") as demo:
         gr.Markdown("## ⚒️ Anvil")
 
         agent_hist_state = gr.State([])
@@ -930,21 +930,26 @@ def launch():
                 return msg_value.get("text", ""), msg_value.get("files", [])
             return msg_value or "", None
 
-        def _submit_norm(msg_value, files, expiry, chat, agent_hist):
+        def _submit_norm(msg_value, expiry, chat, agent_hist):
+            """MultimodalTextbox path: text AND files both arrive inside msg_value."""
             text, mm_files = _unpack(msg_value)
-            all_files = list(mm_files or []) + list(files or [])
+            all_files = list(mm_files or [])
             for chat_out, hist_out, _f, _t in on_submit(text, all_files, expiry, chat, agent_hist):
-                if file_input is None:
-                    yield chat_out, hist_out, {"text": "", "files": []}
-                else:
-                    yield chat_out, hist_out, None, ""
+                yield chat_out, hist_out, {"text": "", "files": []}
+
+        def _submit_with_files(msg_value, files, expiry, chat, agent_hist):
+            """Plain Textbox path: files come from the separate file_input component."""
+            text, _ = _unpack(msg_value)
+            all_files = list(files or [])
+            for chat_out, hist_out, _f, _t in on_submit(text, all_files, expiry, chat, agent_hist):
+                yield chat_out, hist_out, None, ""
 
         if file_input is None:
             input_box.submit(_submit_norm,
                              inputs=[input_box, expiry_dd, chatbot, agent_hist_state],
                              outputs=[chatbot, agent_hist_state, input_box])
         else:
-            input_box.submit(_submit_norm,
+            input_box.submit(_submit_with_files,
                              inputs=[input_box, file_input, expiry_dd, chatbot, agent_hist_state],
                              outputs=[chatbot, agent_hist_state, file_input, input_box])
 
@@ -958,7 +963,7 @@ def launch():
         queued_demo = demo.queue(default_concurrency_limit=1)
     except TypeError:
         queued_demo = demo.queue()
-    queued_demo.launch(share=True, debug=False, inline=True, show_error=True)
+    queued_demo.launch(share=True, debug=False, inline=True, show_error=True, css=_CSS)
 
 
 if __name__ == "__main__":
